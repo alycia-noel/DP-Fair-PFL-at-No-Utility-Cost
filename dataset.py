@@ -162,6 +162,8 @@ def gen_random_loaders(data_name, num_users, bz, classes_per_user):
     """
     loader_params = {"batch_size": bz, "shuffle": False, "pin_memory": True, "num_workers": 0}
     dataloaders = []
+    total_num_points = 0
+
     datasets = get_datasets(data_name, normalize=True)
     for i, d in enumerate(datasets):
         # ensure same partition for train/test/val
@@ -169,9 +171,16 @@ def gen_random_loaders(data_name, num_users, bz, classes_per_user):
             cls_partitions = gen_classes_per_node(d, num_users, classes_per_user)
             loader_params['shuffle'] = True
         usr_subset_idx = gen_data_split(d, num_users, cls_partitions)
+
+        if i == 0:
+            for i in range(len(usr_subset_idx)):
+                total_num_points += len(usr_subset_idx[i])
+
+            num_points_p_c = [len(x) for x in usr_subset_idx]
+
         # create subsets for each client
         subsets = list(map(lambda x: torch.utils.data.Subset(d, x), usr_subset_idx))
         # create dataloaders from subsets
         dataloaders.append(list(map(lambda x: torch.utils.data.DataLoader(x, **loader_params), subsets)))
 
-    return dataloaders
+    return dataloaders, total_num_points, num_points_p_c

@@ -3,13 +3,14 @@ import logging
 import random
 import warnings
 from collections import OrderedDict, defaultdict
+from functools import reduce
 import numpy as np
 import torch
 import torch.utils.data
 from tqdm import trange
 from models import CNNHyper, CNNTarget
 from node import BaseNodes
-from utils import seed_everything, set_logger, metrics
+from utils import seed_everything, set_logger
 
 warnings.filterwarnings("ignore")
 
@@ -18,7 +19,7 @@ def evaluate(nodes, num_nodes, hnet, model, device):
 
     hnet.eval()
 
-    results = defaultdict(lambda: defaultdict(list))
+    results = defaultdict(lambda: defaultdict(int))
 
     preds = []
     true = []
@@ -70,22 +71,37 @@ def evaluate(nodes, num_nodes, hnet, model, device):
 
 def train(device, data_name, classes_per_node, num_nodes, steps, inner_steps, lr, inner_lr, wd, inner_wd, hyper_hid, n_hidden, bs, n_kernels):
 
-    avg_acc = [[] for i in range(num_nodes + 1)]
+    avg_acc = [[] for _ in range(num_nodes + 1)]
 
-    models = [None for i in range(num_nodes)]
-    client_opt = [None for i in range(num_nodes)]
+    client_models = []
+    client_opt = []
+    client_losses = [0 for _ in range(num_nodes)]
 
     for i in range(1):
         seed_everything(0)
 
         nodes = BaseNodes(data_name, num_nodes, bs, classes_per_node)
+
+        total_num_points = nodes.total_num_points
+        num_points_p_c = nodes.num_points_p_c
+
+        # Probability distribution for sampling clients
+        p_k = [x / total_num_points for x in num_points_p_c]
+
+        # r_k is the ordering of clients based on loss. it is initially a random ordering
+        r_k = [r for r in range(num_nodes)]
+        random.shuffle(r_k)
+
+        # Lambda / p_k for regularization (lambda controls trade off between accuracy and client parity)
+        lambda_pk = [.5 / p for p in p_k]
+
         embed_dim = int(1 + num_nodes / 4)
 
         hnet = CNNHyper(num_nodes, embed_dim, hidden_dim=hyper_hid, n_hidden=n_hidden, n_kernels=n_kernels)
 
-        for i in range(num_nodes):
-            models[i] = CNNTarget(n_kernels=n_kernels)
-            client_opt[i] = torch.optim.SGD(models[i].parameters(), lr=inner_lr, momentum=.9, weight_decay=inner_wd)
+        for n in range(num_nodes):
+            client_models.append(CNNTarget(n_kernels=n_kernels))
+            client_opt.append(torch.optim.SGD(client_models[n].parameters(), lr=inner_lr, momentum=.9, weight_decay=inner_wd))
 
 
         hnet.to(device)
@@ -96,38 +112,81 @@ def train(device, data_name, classes_per_node, num_nodes, steps, inner_steps, lr
 
         for _ in step_iter:
             hnet.train()
-            node_id = random.choice(range(num_nodes))
 
-            model = models[node_id]
-            inner_opt = client_opt[node_id]
+            # Sample 10 nodes according to the probability distribution p_k
+            node_ids = [np.random.choice(np.arange(0, num_nodes), p=p_k) for _ in range(10)]
 
-            weights = hnet(torch.tensor([node_id], dtype=torch.long).to(device))
-            model.load_state_dict(weights)
-            model.to(device)
+            # Update r_k
+            for k in range(num_nodes):
+                running_r_k = 0
 
-            inner_state = OrderedDict({k: tensor.data for k, tensor in weights.items()})
+                for j in range(num_nodes):
+                    if k == j:
+                        continue
 
-            model.train()
+                    running_r_k += np.sign(client_losses[k] - client_losses[j])
 
-            for j in range(inner_steps):
-                inner_opt.zero_grad()
+                r_k[k] = running_r_k
+
+            print(r_k)
+
+            models = [client_models[node_id] for node_id in node_ids]
+            inner_opts = [client_opt[node_id] for node_id in node_ids]
+
+            weights = [hnet(torch.tensor([node_id], dtype=torch.long).to(device)) for node_id in node_ids]
+
+            for h in range(10):
+                models[h].load_state_dict(weights[h])
+                models[h].to(device)
+                models[h].train()
+
+            inner_states = [OrderedDict({k: tensor.data for k, tensor in weights[q].items()}) for q in range(10)]
+            delta_thetas = [[] for _ in range(10)]
+
+            for x in range(10):
+                node_num = node_ids[x]
+                model = models[x]
+                inner_opt = inner_opts[x]
+                inner_state = inner_states[x]
+                weight = weights[x]
+
+                for j in range(inner_steps):
+                    inner_opt.zero_grad()
+                    opt.zero_grad()
+
+                    batch = next(iter(nodes.train_loaders[node_num]))
+                    x, y = tuple(t.to(device) for t in batch)
+
+                    pred = model(x)
+
+                    err = loss(pred, y)
+
+                    err.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 50)
+
+                    for group in inner_opt.param_groups:
+                        for p in group['params']:
+                            p.grad = (1 + lambda_pk[node_num]*r_k[node_num]) * p.grad
+
+                    inner_opt.step()
+
+                client_losses[node_num] = err.item()
+
                 opt.zero_grad()
+                final_state = model.state_dict()
+                dt = list(OrderedDict({k: inner_state[k] - final_state[k] for k in weight.keys()}).values())
 
-                batch = next(iter(nodes.train_loaders[node_id]))
-                x, y = tuple(t.to(device) for t in batch)
+                for t in range(len(dt)):
+                    delta_thetas[t].append(dt[t])
 
-                pred = model(x)
-                err = loss(pred, y)
+            # Need to perform aggregation here
+            summed_delta_theta = [[] for _ in range(10)]
 
-                err.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 50)
-                inner_opt.step()
+            for b in range(10):
+                summed_delta_theta[b] = reduce(torch.add, delta_thetas[b])
+                summed_delta_theta[b] = (1/10) * summed_delta_theta[b]
 
-            opt.zero_grad()
-            final_state = model.state_dict()
-            delta_theta = OrderedDict({k: inner_state[k] - final_state[k] for k in weights.keys()})
-
-            hnet_grads = torch.autograd.grad(list(weights.values()), hnet.parameters(), grad_outputs=list(delta_theta.values()))
+            hnet_grads = torch.autograd.grad(list(weight.values()), hnet.parameters(), grad_outputs=summed_delta_theta)
 
             for p, g in zip(hnet.parameters(), hnet_grads):
                 p.grad = g
@@ -136,12 +195,12 @@ def train(device, data_name, classes_per_node, num_nodes, steps, inner_steps, lr
 
             opt.step()
 
-        step_results, mean_acc, acc_p_client = evaluate(nodes=nodes, num_nodes=num_nodes, hnet=hnet, model=models, device=device)
+        step_results, mean_acc, acc_p_client = evaluate(nodes=nodes, num_nodes=num_nodes, hnet=hnet, model=client_models, device=device)
 
         logging.info(f"\n\nFinal Results | AVG Acc: {mean_acc:.4f}")
         avg_acc[0].append(mean_acc)
-        for i in range(num_nodes):
-            avg_acc[i + 1].append(acc_p_client[i])
+        for n in range(num_nodes):
+            avg_acc[n + 1].append(acc_p_client[n])
 
 
     print(f"\n\nFinal Results | AVG Acc: {np.mean(avg_acc[0]):.4f}")
@@ -155,7 +214,7 @@ def main():
 
     parser.add_argument("--data_name", type=str, default="cifar10", choices=["cifar10", "cifar100"], help="choice of dataset")
     parser.add_argument("--num_nodes", type=int, default=50, help="number of simulated clients")
-    parser.add_argument("--num_steps", type=int, default=100)
+    parser.add_argument("--num_steps", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--inner_steps", type=int, default=50, help="number of inner steps")
     parser.add_argument("--n_hidden", type=int, default=3, help="num. hidden layers")
